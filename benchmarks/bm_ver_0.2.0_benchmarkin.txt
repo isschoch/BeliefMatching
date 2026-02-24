@@ -1,0 +1,12 @@
+BeliefMatching decoder benchmark
+  (warmup + repeated runs; report mean ± std)
+
+--- Surface code d=7 (detectors=336, observables=1) ---
+  Decoder init:     129.67 ± 9.98 ms
+  Single decode:    14.90 ± 1.46 ms  (67 decodes/s)
+  Batch (   1):      15.31 ± 0.13 ms total  15.315 ms/shot  65 decodes/s
+  Batch (  10):      152.66 ± 1.40 ms total  15.266 ms/shot  66 decodes/s
+  Batch (  50):      756.31 ± 13.39 ms total  15.126 ms/shot  66 decodes/s
+  Batch ( 100):      1511.70 ± 3.01 ms total  15.117 ms/shot  66 decodes/s
+  Batch ( 200):      3011.87 ± 2.97 ms total  15.059 ms/shot  66 decodes/s
+
