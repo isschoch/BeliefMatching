@@ -1,4 +1,4 @@
-from typing import List, FrozenSet, Dict, Tuple, Union
+from typing import List, FrozenSet, Dict, Tuple, Union, Optional
 from dataclasses import dataclass
 
 try:
@@ -6,6 +6,7 @@ try:
 
     def create_decoder(pcm, priors, **kwargs):
         return BpDecoder(pcm=pcm, error_channel=list(priors), **kwargs)
+
 except ImportError:
     from ldpc import bp_decoder
 
@@ -19,6 +20,10 @@ import numpy as np
 
 import stim
 import pymatching
+
+# New imports for matching cache
+import threading
+from collections import OrderedDict
 
 
 def iter_set_xor(set_list: List[List[int]]) -> FrozenSet[int]:
@@ -191,6 +196,8 @@ class BeliefMatching:
         model: Union[stim.Circuit, stim.DetectorErrorModel],
         max_bp_iters: int = 20,
         bp_method: str = "product_sum",
+        *,
+        matching_cache_size: Optional[int] = None,
         **kwargs,
     ):
         """
@@ -212,6 +219,11 @@ class BeliefMatching:
             `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
              "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
              for details). Default is "product_sum"
+        matching_cache_size : int | None
+            Control the size of the Matching cache:
+              - None => unlimited caching
+              - 0 => caching disabled (original behaviour)
+              - positive int => LRU cache capacity
         kwargs
             Additional keyword arguments are passed to `ldpc.bp_decoder`
         """
@@ -220,6 +232,17 @@ class BeliefMatching:
         self._initialise_from_detector_error_model(
             model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
         )
+
+        # Matching cache: keys are exact bytes of the float64 weights
+        # If matching_cache_size is None => unlimited; if 0 => disabled.
+        self._matching_cache_size = matching_cache_size
+        if matching_cache_size == 0:
+            # caching disabled
+            self._matching_cache = None
+        else:
+            # OrderedDict used for optional LRU eviction when size is positive int
+            self._matching_cache = OrderedDict()
+        self._matching_cache_lock = threading.Lock()
 
     def _initialise_from_detector_error_model(
         self,
@@ -249,36 +272,14 @@ class BeliefMatching:
         bp_method: str = "product_sum",
         **kwargs,
     ) -> "BeliefMatching":
-        """
-        Construct a BeliefMatching object from a `stim.DetectorErrorModel`
-
-        Parameters
-        ----------
-        model : stim.DetectorErrorModel
-            A `stim.DetectorErrorModel`. It is important that the hyperedges are already decomposed
-            into edges (using `decompose_errors=True`) for BeliefMatching to provide improved accuracy over
-            a standard (faster) MWPM decoder.
-        max_bp_iters : int
-            The maximum number of interations of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `max_iter` argument. Default 20
-        bp_method : str
-            The method of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
-             "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
-             for details). Default is "product_sum"
-        kwargs
-            Additional keyword arguments are passed to `ldpc.bp_decoder`
-
-
-        Returns
-        -------
-        BeliefMatching
-            The BeliefMatching object for decoding using `model`
-        """
         bm = cls.__new__(cls)
         bm._initialise_from_detector_error_model(
             model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
         )
+        # initialize cache attributes with defaults (no cache)
+        bm._matching_cache_size = None
+        bm._matching_cache = OrderedDict()
+        bm._matching_cache_lock = threading.Lock()
         return bm
 
     @classmethod
@@ -290,37 +291,74 @@ class BeliefMatching:
         bp_method: str = "product_sum",
         **kwargs,
     ) -> "BeliefMatching":
-        """
-        Construct a BeliefMatching object from a `stim.Circuit`
-
-        Parameters
-        ----------
-        circuit : stim.Circuit
-            A stim.Circuit. The circuit will be converted into a stim.DetectorErrorModel using
-            `stim.Circuit.detector_error_model(decompose_errors=True)`.
-        max_bp_iters : int
-            The maximum number of interations of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `max_iter` argument. Default 20
-        bp_method : str
-            The method of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
-             "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
-             for details). Default is "product_sum"
-        kwargs
-            Additional keyword arguments are passed to `ldpc.bp_decoder`
-
-
-        Returns
-        -------
-        BeliefMatching
-            The BeliefMatching object for decoding using `model`
-        """
         bm = cls.__new__(cls)
         model = circuit.detector_error_model(decompose_errors=True)
         bm._initialise_from_detector_error_model(
             model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
         )
+        # initialize cache attributes with defaults (no cache)
+        bm._matching_cache_size = None
+        bm._matching_cache = OrderedDict()
+        bm._matching_cache_lock = threading.Lock()
         return bm
+
+    def _get_or_build_matching(self, weights: np.ndarray) -> "pymatching.Matching":
+        """
+        Return a pymatching.Matching for the exact weights array,
+        constructing and caching it if necessary.
+
+        Caching behavior:
+          - If self._matching_cache is None -> caching disabled, construct a new Matching.
+          - Else use exact bytes of float64 weights as key.
+          - If capacity (self._matching_cache_size) is a positive int, use LRU eviction.
+        """
+        # If caching disabled: always build new matching (original behavior).
+        if self._matching_cache is None:
+            return pymatching.Matching.from_check_matrix(
+                self._matrices.edge_check_matrix,
+                weights=weights,
+                faults_matrix=self._matrices.edge_observables_matrix,
+                use_virtual_boundary_node=True,
+            )
+
+        # Normalize weights into a deterministic contiguous float64 bytes representation
+        w = np.ascontiguousarray(weights, dtype=np.float64)
+        key = w.tobytes()
+
+        # Fast path check under lock
+        with self._matching_cache_lock:
+            matching = self._matching_cache.get(key)
+            if matching is not None:
+                # mark as recently used (LRU semantics)
+                try:
+                    # move_to_end exists on OrderedDict
+                    self._matching_cache.move_to_end(key)
+                except Exception:
+                    pass
+                return matching
+
+        # Build Matching outside lock (construction may be expensive)
+        new_matching = pymatching.Matching.from_check_matrix(
+            self._matrices.edge_check_matrix,
+            weights=w,
+            faults_matrix=self._matrices.edge_observables_matrix,
+            use_virtual_boundary_node=True,
+        )
+
+        # Insert into cache under lock and perform eviction if necessary
+        with self._matching_cache_lock:
+            self._matching_cache[key] = new_matching
+            if (
+                isinstance(self._matching_cache_size, int)
+                and self._matching_cache_size > 0
+            ):
+                while len(self._matching_cache) > self._matching_cache_size:
+                    # Evict oldest item
+                    try:
+                        self._matching_cache.popitem(last=False)
+                    except KeyError:
+                        break
+        return new_matching
 
     def decode(self, syndrome: np.ndarray) -> np.ndarray:
         """
@@ -336,26 +374,28 @@ class BeliefMatching:
         Returns
         -------
         np.ndarray
-            A binary numpy array `predictions` which predicts which observables were flipped.
-            Its length is equal to the number of observables in the `stim.Circuit` or `stim.DetectorErrorModel`.
-            `predictions[i]` is 1 if the decoder predicts observable `i` was flipped and 0 otherwise.
+            A binary numpy array `predictions` (dtype bool) which predicts which observables were flipped.
         """
         corr = self._bpd.decode(syndrome)
         if self._bpd.converge:
-            return (self._matrices.observables_matrix @ corr) % 2
+            # vectorized projection; ensure boolean ndarray
+            obs_vec = (self._matrices.observables_matrix @ corr) % 2
+            return np.asarray(obs_vec, dtype=bool).ravel()
         llrs = self._bpd.log_prob_ratios
-        ps_h = 1 / (1 + np.exp(llrs))
+        ps_h = 1.0 / (1.0 + np.exp(llrs))
         ps_e = self._matrices.hyperedge_to_edge_matrix @ ps_h
         eps = 1e-14
         ps_e[ps_e > 1 - eps] = 1 - eps
         ps_e[ps_e < eps] = eps
-        matching = pymatching.Matching.from_check_matrix(
-            self._matrices.edge_check_matrix,
-            weights=-np.log(ps_e),
-            faults_matrix=self._matrices.edge_observables_matrix,
-            use_virtual_boundary_node=True,
-        )
-        return matching.decode(syndrome)
+
+        # compute weights exactly as before
+        weights = -np.log(ps_e)
+
+        # Use cached or newly-built Matching (exact semantics)
+        matching = self._get_or_build_matching(weights)
+        pred = matching.decode(syndrome)
+        # ensure boolean ndarray
+        return np.asarray(pred, dtype=bool).ravel()
 
     def decode_batch(self, shots: np.ndarray) -> np.ndarray:
         """
@@ -374,9 +414,9 @@ class BeliefMatching:
             A 2D numpy array `predictions` of dtype bool, where `predictions[i, :]` is the output of
             `self.decode(shots[i, :])`.
         """
-        predictions = np.zeros(
-            (shots.shape[0], self._matrices.observables_matrix.shape[0]), dtype=bool
-        )
-        for i in range(shots.shape[0]):
+        n_shots = shots.shape[0]
+        n_obs = self._matrices.observables_matrix.shape[0]
+        predictions = np.zeros((n_shots, n_obs), dtype=bool)
+        for i in range(n_shots):
             predictions[i, :] = self.decode(shots[i, :])
         return predictions
