@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-Simple benchmark for the BeliefMatching decoder.
+Benchmark for BeliefMatching and (optionally) PyMatching (MWPM).
 
 Times decoder construction, single-shot decode, and batch decode at various
-batch sizes. Use this to measure baseline performance and to validate
-optimizations.
+batch sizes for both decoders for direct comparison.
 
 Usage:
     python benchmarks/benchmark_belief_matching.py
-    python benchmarks/benchmark_belief_matching.py --distance 5 --distance 7
+    python benchmarks/benchmark_belief_matching.py --distance 5 7 --shots 500
+    python benchmarks/benchmark_belief_matching.py --no-compare-mwpm
 """
 
 import argparse
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import stim
 
 from beliefmatching import BeliefMatching
+
+try:
+    import pymatching
+
+    PYMATCHING_AVAILABLE = True
+except Exception:
+    PYMATCHING_AVAILABLE = False
 
 
 def make_surface_code_circuit(distance: int, p: float = 0.01) -> stim.Circuit:
@@ -41,8 +48,10 @@ def sample_syndromes(circuit: stim.Circuit, num_shots: int) -> np.ndarray:
     return shots  # shape (num_shots, num_detectors)
 
 
-def time_init(circuit: stim.Circuit, runs: int = 5) -> Tuple[float, float]:
-    """Time decoder construction (mean and std over runs, seconds)."""
+def time_init_beliefmatching(
+    circuit: stim.Circuit, runs: int = 5
+) -> Tuple[float, float]:
+    """Time BeliefMatching constructor (mean and std over runs, seconds)."""
     times_s = []
     for _ in range(runs):
         t0 = time.perf_counter()
@@ -51,13 +60,28 @@ def time_init(circuit: stim.Circuit, runs: int = 5) -> Tuple[float, float]:
     return float(np.mean(times_s)), float(np.std(times_s))
 
 
-def time_decode_single(
+def time_init_pymatching(
+    dem: stim.DetectorErrorModel, runs: int = 5
+) -> Tuple[float, float]:
+    """Time PyMatching Matching initialization (mean and std over runs, seconds)."""
+    if not PYMATCHING_AVAILABLE:
+        return float("nan"), float("nan")
+    times_s = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        # Construct Matching directly from stim DetectorErrorModel.
+        _ = pymatching.Matching(dem)
+        times_s.append(time.perf_counter() - t0)
+    return float(np.mean(times_s)), float(np.std(times_s))
+
+
+def time_decode_single_beliefmatching(
     bm: BeliefMatching,
     syndromes: np.ndarray,
     warmup: int = 3,
     timed_runs: int = 50,
 ) -> Tuple[float, float]:
-    """Time single-shot decode: mean and std per decode (seconds)."""
+    """Time single-shot decode for BeliefMatching: mean and std per decode (seconds)."""
     for i in range(warmup):
         _ = bm.decode(syndromes[i % len(syndromes)])
     times_s = []
@@ -69,13 +93,13 @@ def time_decode_single(
     return float(np.mean(times_s)), float(np.std(times_s))
 
 
-def time_decode_batch(
+def time_decode_batch_beliefmatching(
     bm: BeliefMatching,
     shots: np.ndarray,
     warmup: int = 1,
     timed_runs: int = 5,
 ) -> Tuple[float, float]:
-    """Time batch decode: mean and std per batch (seconds)."""
+    """Time batch decode for BeliefMatching: mean and std per batch (seconds)."""
     for _ in range(warmup):
         _ = bm.decode_batch(shots)
     times_s = []
@@ -86,10 +110,51 @@ def time_decode_batch(
     return float(np.mean(times_s)), float(np.std(times_s))
 
 
+def time_decode_single_pymatching(
+    mm: "pymatching.Matching",
+    syndromes: np.ndarray,
+    warmup: int = 3,
+    timed_runs: int = 50,
+) -> Tuple[float, float]:
+    """Time single-shot decode for PyMatching: mean and std per decode (seconds)."""
+    if not PYMATCHING_AVAILABLE:
+        return float("nan"), float("nan")
+    # ensure syndromes are integer/bool 1D arrays when passed to decode
+    for i in range(warmup):
+        _ = mm.decode(syndromes[i % len(syndromes)])
+    times_s = []
+    for i in range(timed_runs):
+        s = syndromes[i % len(syndromes)]
+        t0 = time.perf_counter()
+        _ = mm.decode(s)
+        times_s.append(time.perf_counter() - t0)
+    return float(np.mean(times_s)), float(np.std(times_s))
+
+
+def time_decode_batch_pymatching(
+    mm: "pymatching.Matching",
+    shots: np.ndarray,
+    warmup: int = 1,
+    timed_runs: int = 5,
+) -> Tuple[float, float]:
+    """Time batch decode for PyMatching: mean and std per batch (seconds)."""
+    if not PYMATCHING_AVAILABLE:
+        return float("nan"), float("nan")
+    for _ in range(warmup):
+        _ = mm.decode_batch(shots)
+    times_s = []
+    for _ in range(timed_runs):
+        t0 = time.perf_counter()
+        _ = mm.decode_batch(shots)
+        times_s.append(time.perf_counter() - t0)
+    return float(np.mean(times_s)), float(np.std(times_s))
+
+
 def run_benchmark(
     distance: int,
     num_syndrome_shots: int = 200,
     batch_sizes: List[int] = None,
+    compare_mwpm: bool = True,
 ) -> None:
     if batch_sizes is None:
         batch_sizes = [1, 10, 50, 100, 200]
@@ -100,33 +165,76 @@ def run_benchmark(
     n_det = dem.num_detectors
     n_obs = dem.num_observables
 
-    print(f"\n--- Surface code d={distance} (detectors={n_det}, observables={n_obs}) ---")
+    print(
+        f"\n--- Surface code d={distance} (detectors={n_det}, observables={n_obs}) ---"
+    )
 
-    # Decoder init
-    mean_s, std_s = time_init(circuit)
+    # ----------------
+    # BeliefMatching
+    # ----------------
+    mean_s, std_s = time_init_beliefmatching(circuit)
+    print(f"BeliefMatching:")
     print(f"  Decoder init:     {mean_s*1000:.2f} ± {std_s*1000:.2f} ms")
 
     bm = BeliefMatching(circuit, max_bp_iters=20, bp_method="product_sum")
     syndromes = sample_syndromes(circuit, num_syndrome_shots)
 
-    # Single-shot decode
-    mean_s, std_s = time_decode_single(bm, syndromes)
-    print(f"  Single decode:    {mean_s*1000:.2f} ± {std_s*1000:.2f} ms  ({1/mean_s:.0f} decodes/s)")
+    mean_s, std_s = time_decode_single_beliefmatching(bm, syndromes)
+    print(
+        f"  Single decode:    {mean_s*1000:.2f} ± {std_s*1000:.2f} ms  ({0 if mean_s==0 else 1/mean_s:.0f} decodes/s)"
+    )
 
-    # Batch decode
     for batch_size in batch_sizes:
         if batch_size > num_syndrome_shots:
             continue
         batch = syndromes[:batch_size]
-        mean_s, std_s = time_decode_batch(bm, batch)
+        mean_s, std_s = time_decode_batch_beliefmatching(bm, batch)
         per_shot_ms = mean_s * 1000 / batch_size
-        throughput = batch_size / mean_s
-        print(f"  Batch ({batch_size:4d}):      {mean_s*1000:.2f} ± {std_s*1000:.2f} ms total  "
-              f"{per_shot_ms:.3f} ms/shot  {throughput:.0f} decodes/s")
+        throughput = batch_size / mean_s if mean_s != 0 else float("inf")
+        print(
+            f"  Batch ({batch_size:4d}):      {mean_s*1000:.2f} ± {std_s*1000:.2f} ms total  "
+            f"{per_shot_ms:.3f} ms/shot  {throughput:.0f} decodes/s"
+        )
+
+    # ----------------
+    # PyMatching (MWPM)
+    # ----------------
+    if compare_mwpm:
+        print("\nPyMatching (MWPM):")
+        if not PYMATCHING_AVAILABLE:
+            print(
+                "  pymatching not available (import failed). Install with 'pip install pymatching' to enable."
+            )
+            return
+
+        mean_s, std_s = time_init_pymatching(dem)
+        print(f"  Decoder init:     {mean_s*1000:.2f} ± {std_s*1000:.2f} ms")
+
+        # create a single persistent Matching to decode with
+        mm = pymatching.Matching(dem)
+
+        mean_s, std_s = time_decode_single_pymatching(mm, syndromes)
+        print(
+            f"  Single decode:    {mean_s*1000:.2f} ± {std_s*1000:.2f} ms  ({0 if mean_s==0 else 1/mean_s:.0f} decodes/s)"
+        )
+
+        for batch_size in batch_sizes:
+            if batch_size > num_syndrome_shots:
+                continue
+            batch = syndromes[:batch_size]
+            mean_s, std_s = time_decode_batch_pymatching(mm, batch)
+            per_shot_ms = mean_s * 1000 / batch_size
+            throughput = batch_size / mean_s if mean_s != 0 else float("inf")
+            print(
+                f"  Batch ({batch_size:4d}):      {mean_s*1000:.2f} ± {std_s*1000:.2f} ms total  "
+                f"{per_shot_ms:.3f} ms/shot  {throughput:.0f} decodes/s"
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark BeliefMatching decoder")
+    parser = argparse.ArgumentParser(
+        description="Benchmark BeliefMatching and optional PyMatching decoder"
+    )
     parser.add_argument(
         "--distance",
         type=int,
@@ -147,13 +255,24 @@ def main():
         default=[1, 10, 50, 100, 200],
         help="Batch sizes for decode_batch (default: 1 10 50 100 200)",
     )
+    parser.add_argument(
+        "--compare-mwpm",
+        dest="compare_mwpm",
+        action="store_true",
+        help="Don't benchmark PyMatching (MWPM)",
+    )
     args = parser.parse_args()
 
-    print("BeliefMatching decoder benchmark")
+    print("BeliefMatching vs PyMatching (MWPM) benchmark")
     print("  (warmup + repeated runs; report mean ± std)")
 
     for d in args.distance:
-        run_benchmark(d, num_syndrome_shots=args.shots, batch_sizes=args.batch_sizes)
+        run_benchmark(
+            d,
+            num_syndrome_shots=args.shots,
+            batch_sizes=args.batch_sizes,
+            compare_mwpm=args.compare_mwpm,
+        )
 
     print()
 
